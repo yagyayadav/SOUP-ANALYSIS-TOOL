@@ -2,7 +2,7 @@
 SOUP Analysis Tool
 ------------------
 AI-driven initial SOUP listing for medical device software.
-Implements — Initial Risk Profiling (IEC 62304).
+Implements Initial Risk Profiling (IEC 62304).
 
 Usage:
     python tool.py --description project_desc.md --sbom sbom.json
@@ -13,19 +13,15 @@ Usage:
 import argparse
 import json
 import os
-import re
+import subprocess
 import sys
 import time
-import subprocess
 
-# ---------------------------------------------------------------------------
-# Dependencies
-# ---------------------------------------------------------------------------
-
+# install required packages if not present
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
-for pkg in ["pandas", "packaging", "anthropic", "google-genai"]:
+for pkg in ["pandas", "anthropic", "google-genai"]:
     try:
         __import__(pkg.replace("-", "_").split(".")[0])
     except ImportError:
@@ -33,346 +29,306 @@ for pkg in ["pandas", "packaging", "anthropic", "google-genai"]:
         install(pkg)
 
 import pandas as pd
-from packaging.requirements import Requirement
+
+SOURCE_DIR = "."
 import anthropic
 from google import genai as google_genai
 from google.genai import types as genai_types
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="AI-driven SOUP analysis tool for medical device software (IEC 62304)."
     )
-    parser.add_argument(
-        "--description", required=True,
-        help="Path to project description file (.md or .txt)"
-    )
-    parser.add_argument(
-        "--sbom", required=True,
-        help="Path to SBOM file (CycloneDX JSON from syft) or requirements.txt"
-    )
-    parser.add_argument(
-        "--source", default=None,
-        help="Path to project source directory for reachability scan (optional)"
-    )
-    parser.add_argument(
-        "--provider", default="gemini", choices=["gemini", "claude"],
-        help="AI provider to use (default: gemini)"
-    )
-    parser.add_argument(
-        "--output", default="soup_register.csv",
-        help="Output CSV file (default: soup_register.csv)"
-    )
+    parser.add_argument("--description", required=True,
+        help="Path to project description file (.md or .txt)")
+    parser.add_argument("--sbom", required=True,
+        help="Path to SBOM or manifest file — any format, AI will parse it")
+    parser.add_argument("--source", default=".",
+        help="Project source directory for grep commands (default: current dir)")
+    parser.add_argument("--source", default=".",
+        help="Project source directory for context commands (default: current dir)")
+    parser.add_argument("--provider", default="gemini", choices=["gemini", "claude"],
+        help="AI provider (default: gemini)")
+    parser.add_argument("--output", default="soup_register.csv",
+        help="Output CSV filename (default: soup_register.csv)")
     return parser.parse_args()
 
-# ---------------------------------------------------------------------------
-# SBOM / manifest ingestion
-# ---------------------------------------------------------------------------
 
-def parse_sbom(sbom_path):
-    """Read a CycloneDX SBOM. Returns list of component dicts."""
-    if not os.path.isfile(sbom_path):
-        print(f"[WARN] {sbom_path} not found.")
-        return []
-    with open(sbom_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("bomFormat") != "CycloneDX":
-        print("[WARN] File does not appear to be a CycloneDX SBOM.")
-        return []
-    components = []
-    for comp in data.get("components", []):
-        name     = comp.get("name", "").strip()
-        version  = comp.get("version", "").strip() or "unpinned"
-        purl     = comp.get("purl", "")
-        supplier = comp.get("supplier", {}).get("name", "") if comp.get("supplier") else ""
-        if not supplier:
-            supplier = "PyPI / " + name
-        if name:
-            components.append({"name": name, "version": version,
-                                "purl": purl, "supplier": supplier})
-    print(f"[INFO] SBOM parsed: {len(components)} components found.")
-    return components
+def read_file(path):
+    if not os.path.isfile(path):
+        print(f"[ERROR] File not found: {path}")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
 
 
-def parse_manifest(manifest_path):
-    """
-    Parse any manifest file the AI cannot parse directly.
-    Supports: requirements.txt
-    For other formats (package.json, go.mod, Cargo.toml) — raw content
-    is passed to the AI to parse.
-    """
-    components = []
-    ext = os.path.splitext(manifest_path)[1].lower()
-    fname = os.path.basename(manifest_path).lower()
-
-    if fname == "requirements.txt" or ext == ".txt":
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith(("#", "-")):
-                    continue
-                line = line.split("#")[0].strip()
-                try:
-                    req     = Requirement(line)
-                    specs   = list(req.specifier)
-                    version = specs[0].version if specs else "unpinned"
-                    components.append({"name": req.name, "version": version,
-                                        "purl": "", "supplier": "PyPI / " + req.name})
-                except Exception:
-                    name = re.split(r"[>=<!\[\s]", line)[0].strip()
-                    if name:
-                        components.append({"name": name, "version": "unpinned",
-                                            "purl": "", "supplier": "PyPI / " + name})
-        print(f"[INFO] requirements.txt parsed: {len(components)} components.")
-        return components
-
-    # For all other manifest types — return raw content for AI to parse
-    with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()  # raw string — AI will handle it
+def run_subcommand(command, source_dir):
+    # replace any placeholder paths with the actual source directory
+    command = command.replace("/path/to/project", source_dir)
+    command = command.replace("<project_dir>", source_dir)
+    command = command.replace("$PROJECT", source_dir)
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=30
+        )
+        return result.stdout + result.stderr
+    except Exception as e:
+        return f"[Error running command: {e}]"
 
 
-def load_manifest(sbom_path):
-    """
-    Smart loader: tries CycloneDX SBOM first, then requirements.txt parser,
-    then returns raw content for AI to handle.
-    """
-    ext   = os.path.splitext(sbom_path)[1].lower()
-    fname = os.path.basename(sbom_path).lower()
-
-    if ext == ".json":
-        components = parse_sbom(sbom_path)
-        if components:
-            return components, "sbom"
-        # JSON but not CycloneDX — pass raw to AI
-        with open(sbom_path, "r", encoding="utf-8") as f:
-            return f.read(), "raw"
-
-    result = parse_manifest(sbom_path)
-    if isinstance(result, list):
-        return result, "requirements"
-    return result, "raw"  # raw string for AI
-
-
-# ---------------------------------------------------------------------------
-# Source code reachability scan
-# ---------------------------------------------------------------------------
-
-def scan_direct_imports(project_dir):
-    """
-    Scan all .py files and return a dict of { package: [files] }.
-    Detects directly imported packages — e.g. SciPy imported in
-    feature_extractor.py even if not in requirements.txt.
-    """
-    import_map = {}
-    import_re  = re.compile(r"^\s*import\s+([\w]+)", re.MULTILINE)
-    from_re    = re.compile(r"^\s*from\s+([\w]+)", re.MULTILINE)
-
-    if not os.path.isdir(project_dir):
-        print(f"[WARN] Source directory not found: {project_dir}")
-        return import_map
-
-    py_files = 0
-    for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".")
-                   and d not in ("__pycache__", ".git", "node_modules",
-                                  "venv", ".venv", "build", "dist")]
-        for fname in files:
-            if not fname.endswith(".py"):
-                continue
-            fpath = os.path.join(root, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
-                    src = fh.read()
-                py_files += 1
-                for match in import_re.findall(src) + from_re.findall(src):
-                    pkg = match.lower().split(".")[0]
-                    import_map.setdefault(pkg, [])
-                    rel = os.path.relpath(fpath, project_dir)
-                    if rel not in import_map[pkg]:
-                        import_map[pkg].append(rel)
-            except Exception:
-                continue
-
-    print(f"[INFO] Source scan: {py_files} .py files, {len(import_map)} unique imports.")
-    return import_map
-
-
-def get_reachability(name, import_map):
-    n1 = name.lower().replace("-", "_")
-    n2 = name.lower().replace("-", "").replace("_", "")
-    files = (import_map.get(n1) or import_map.get(name.lower()) or import_map.get(n2) or [])
-    return len(files) > 0, ", ".join(files[:3]) + ("..." if len(files) > 3 else "")
-
-
-# ---------------------------------------------------------------------------
-# Tool / SOUP filter
-# ---------------------------------------------------------------------------
-
-TOOL_KEYWORDS = {
-    "gcc", "pytest", "pylint", "black", "compiler", "tqdm", "flake8",
-    "mypy", "coverage", "setuptools", "wheel", "twine", "sphinx", "isort",
-    "pip", "virtualenv", "build", "mock", "faker", "hypothesis",
-}
-
-def is_tool(name):
-    n = name.lower().replace("-", "").replace("_", "")
-    return any(kw.replace("-", "").replace("_", "") in n for kw in TOOL_KEYWORDS)
-
-
-# ---------------------------------------------------------------------------
-# AI Classification
-# ---------------------------------------------------------------------------
-
-CLASSIFICATION_SYSTEM = """You are a Senior Medical Device Software Safety Engineer performing
-initial SOUP analysis under IEC 62304.
-
-You will be given a SOUP component from a medical device software project.
-Your job is to:
-1. Determine the IEC 62304 Safety Class (A, B, or C) based on the component role
-   in the device given the project description.
-   - Class C: failure could cause serious injury or death
-   - Class B: failure could cause non-serious injury
-   - Class A: no patient safety impact
-2. Describe the intended use of this component in this specific project.
-3. Note any patient safety concerns.
-
-Do NOT use hardcoded knowledge of how specific projects classify components.
-Determine the class from the project description and component context provided.
-
-OUTPUT: valid JSON only, no markdown, no extra text:
-{
-  "class": "C",
-  "intended_use": "one sentence: component role in this device",
-  "rationale": "one sentence: why this class",
-  "patient_safety_concern": "one sentence or None"
-}"""
-
-
-def classify_claude(client, model, component, version, supplier,
-                     directly_imported, import_files, project_context):
-    reach = (f"Directly imported: Yes — found in {import_files}"
-             if directly_imported else "Directly imported: No — transitive dependency")
-    prompt = (
-        f"PROJECT DESCRIPTION:\n{project_context}\n\n"
-        f"COMPONENT:\n"
-        f"  Name: {component} v{version}\n"
-        f"  Supplier: {supplier}\n"
-        f"  {reach}\n\n"
-        f"Assign the IEC 62304 safety class."
-    )
+def call_claude(client, model, system, messages, max_tokens=4096):
     for attempt in range(3):
         try:
             response = client.messages.create(
-                model=model, max_tokens=512,
-                system=CLASSIFICATION_SYSTEM,
-                messages=[{"role": "user", "content": prompt}]
+                model=model, max_tokens=max_tokens,
+                system=system, messages=messages
             )
-            text = response.content[0].text.strip().replace("```json","").replace("```","").strip()
-            return json.loads(text)
+            return response.content[0].text.strip()
         except Exception as e:
             if attempt == 2:
-                return {"class": "B", "intended_use": "Unknown",
-                        "rationale": str(e), "patient_safety_concern": "Evaluation failed"}
+                return f"[Error: {e}]"
             time.sleep(2)
 
 
-def classify_gemini(client, model, component, version, supplier,
-                     directly_imported, import_files, project_context):
-    reach = (f"Directly imported: Yes — found in {import_files}"
-             if directly_imported else "Directly imported: No — transitive dependency")
-    prompt = (
-        f"PROJECT DESCRIPTION:\n{project_context}\n\n"
-        f"COMPONENT:\n"
-        f"  Name: {component} v{version}\n"
-        f"  Supplier: {supplier}\n"
-        f"  {reach}\n\n"
-        f"Assign the IEC 62304 safety class."
-    )
-    full_prompt = CLASSIFICATION_SYSTEM + "\n\n" + prompt
+def call_gemini(client, model, prompt, max_tokens=4096, json_mode=False):
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model=model, contents=full_prompt,
-                config=genai_types.GenerateContentConfig(
-                    max_output_tokens=512, temperature=0.1,
-                    response_mime_type="application/json"
-                )
+            config = genai_types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.1,
+                response_mime_type="application/json" if json_mode else "text/plain"
             )
-            text = response.text.strip().replace("```json","").replace("```","").strip()
-            return json.loads(text)
+            response = client.models.generate_content(
+                model=model, contents=prompt, config=config
+            )
+            return response.text.strip()
         except Exception as e:
             if attempt == 2:
-                return {"class": "B", "intended_use": "Unknown",
-                        "rationale": str(e), "patient_safety_concern": "Evaluation failed"}
+                return f"[Error: {e}]"
             time.sleep(2)
 
 
-# ---------------------------------------------------------------------------
-# Agentic chat loop
-# ---------------------------------------------------------------------------
+# step 1 — AI parses manifest and does initial classification
+# AI handles any format — requirements.txt, package.json, go.mod, CycloneDX JSON etc.
+CLASSIFICATION_SYSTEM = """You are a Medical Device Software Safety Engineer performing
+initial SOUP analysis under IEC 62304.
 
-def run_chat_agent(df_soup, project_description, provider,
-                    claude_client, gemini_client,
-                    claude_model, gemini_model, output_file):
-    """
-    Terminal chat agent — user can ask questions about the SOUP register,
-    request reclassification, filter components, and export results.
-    The agent maintains conversation history for context.
-    """
-    conversation_history = []
+You will be given a project description and a manifest or SBOM file in any format
+(requirements.txt, package.json, go.mod, CycloneDX JSON etc.)
 
-    # Build initial context message
-    soup_summary = df_soup[["name","version","supplier","ai_class",
-                              "ai_intended_use","directly_imported",
-                              "compliance_gap"]].to_string(index=False)
+Your tasks:
+1. Parse the manifest and identify all third-party dependencies
+2. Separate SOUP from development tools (pytest, tqdm, pylint, black etc. are NOT SOUP)
+3. For each SOUP component assign IEC 62304 Safety Class:
+   - Class C: failure could cause serious injury or death
+   - Class B: failure could cause non-serious injury
+   - Class A: no patient safety impact
+4. Describe the intended use of each component in this specific project
+5. Flag unpinned versions as compliance gaps under IEC 62304 S8.1.2
 
-    system_prompt = f"""You are a Senior Medical Device Software Safety Engineer.
-You have completed an initial SOUP analysis for a medical device project.
+Base classification on the project description and component context only.
+
+OUTPUT: valid JSON only, no markdown:
+{
+  "components": [
+    {
+      "name": "numpy",
+      "version": "1.16.5",
+      "supplier": "NumPy developers",
+      "class": "C",
+      "intended_use": "one sentence describing role in this device",
+      "rationale": "one sentence explaining the class",
+      "compliance_gap": ""
+    }
+  ]
+}
+
+Set compliance_gap to "VERSION UNPINNED - IEC 62304 S8.1.2 not satisfied" for unpinned versions.
+Leave compliance_gap as empty string if version is pinned."""
+
+
+def initial_classification(provider, claude_client, gemini_client,
+                            claude_model, gemini_model,
+                            project_description, manifest_content):
+    prompt_user = (
+        f"PROJECT DESCRIPTION:\n{project_description}\n\n"
+        f"MANIFEST/SBOM FILE CONTENT:\n{manifest_content}\n\n"
+        f"Parse this manifest, identify all SOUP components, and classify each one."
+    )
+    if provider == "claude":
+        text = call_claude(claude_client, claude_model, CLASSIFICATION_SYSTEM,
+                           [{"role": "user", "content": prompt_user}])
+    else:
+        text = call_gemini(gemini_client, gemini_model,
+                           CLASSIFICATION_SYSTEM + "\n\n" + prompt_user,
+                           json_mode=True)
+    try:
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text).get("components", [])
+    except Exception:
+        return []
+
+
+# step 2 — context gathering loop before chat starts
+# AI suggests grep commands, user approves, results feed back to AI
+# runs until AI says CONTEXT_COMPLETE or user skips
+CONTEXT_SYSTEM = """You are a Medical Device Software Safety Engineer.
+You have done an initial SOUP classification but need source code context
+to avoid hallucination — you need to know where each library is actually used.
+
+To search the source code, suggest a command using this exact format on its own line:
+SUGGEST_COMMAND: grep -rn "import numpy" <project_dir> --include="*.py"
+
+The user will approve and run it. You will receive the real output.
+Use that output to update your understanding of how the library is used.
+
+When you have enough context for all components, say exactly:
+CONTEXT_COMPLETE
+
+Do not classify based on assumptions — only on evidence from project description
+and actual source code search results."""
+
+
+def context_gathering_loop(provider, claude_client, gemini_client,
+                            claude_model, gemini_model,
+                            project_description, components, source_dir):
+    print("\n" + "="*60)
+    print("Step 2 — Source Code Context Gathering")
+    print("="*60)
+    print("Agent will suggest commands to search source code.")
+    print("You approve each command before it runs.")
+    print("Type 'skip' to go straight to chat.")
+    print("="*60 + "\n")
+
+    comp_summary = json.dumps(components, indent=2)
+    conversation = []
+
+    initial_msg = (
+        f"PROJECT DESCRIPTION:\n{project_description}\n\n"
+        f"SOURCE DIRECTORY: {source_dir}\n\n"
+        f"INITIAL SOUP CLASSIFICATION:\n{comp_summary}\n\n"
+        f"Review the classifications. Suggest grep commands to verify "
+        f"where safety-critical components (Class C first) are actually used. "
+        f"Use {source_dir} as the project path in your commands."
+    )
+    conversation.append({"role": "user", "content": initial_msg})
+
+    max_rounds = 10
+    for _ in range(max_rounds):
+        if provider == "claude":
+            reply = call_claude(claude_client, claude_model,
+                                CONTEXT_SYSTEM, conversation, max_tokens=1024)
+        else:
+            full = CONTEXT_SYSTEM + "\n\n"
+            for msg in conversation:
+                role = "User" if msg["role"] == "user" else "Agent"
+                full += f"{role}: {msg['content']}\n\n"
+            full += "Agent:"
+            reply = call_gemini(gemini_client, gemini_model, full, max_tokens=1024)
+
+        print(f"Agent: {reply}\n")
+        conversation.append({"role": "assistant", "content": reply})
+
+        if "CONTEXT_COMPLETE" in reply:
+            print("[INFO] Agent has enough context. Moving to chat...\n")
+            break
+
+        if "SUGGEST_COMMAND:" in reply:
+            lines = reply.split("\n")
+            cmd_line = next((l for l in lines if "SUGGEST_COMMAND:" in l), None)
+            if cmd_line:
+                suggested_cmd = cmd_line.replace("SUGGEST_COMMAND:", "").strip()
+                print(f"[COMMAND]: {suggested_cmd}")
+                user_input = input("Run? (yes / no / skip): ").strip().lower()
+
+                if user_input == "skip":
+                    print("[INFO] Skipping. Moving to chat...\n")
+                    break
+
+                if user_input in ("yes", "y"):
+                    print("[Running...]\n")
+                    cmd_output = run_subcommand(suggested_cmd, source_dir)
+                    print(f"[Output]:\n{cmd_output}\n")
+                    feedback = (
+                        f"Command output:\n{cmd_output}\n\n"
+                        f"Update your analysis based on this. "
+                        f"Suggest another command if needed or say CONTEXT_COMPLETE."
+                    )
+                    conversation.append({"role": "user", "content": feedback})
+                else:
+                    conversation.append({
+                        "role": "user",
+                        "content": "Command skipped. Suggest another or say CONTEXT_COMPLETE."
+                    })
+        else:
+            user_input = input("You (Enter to continue / 'skip' for chat): ").strip()
+            if user_input.lower() == "skip":
+                break
+            if user_input:
+                conversation.append({"role": "user", "content": user_input})
+            else:
+                conversation.append({
+                    "role": "user",
+                    "content": "Please suggest a command or say CONTEXT_COMPLETE."
+                })
+
+    return conversation
+
+
+# step 3 — chat agent starts after context is gathered
+CHAT_SYSTEM_TEMPLATE = """You are a Medical Device Software Safety Engineer.
+You have completed an initial SOUP analysis with source code context.
 
 PROJECT DESCRIPTION:
 {project_description}
 
-INITIAL SOUP LISTING (already classified):
+SOUP LISTING:
 {soup_summary}
 
-You can answer questions about the SOUP components, explain classifications,
-suggest additional analysis, identify compliance gaps, or update classifications
-if the user provides new information.
+Answer questions about SOUP components, explain classifications,
+identify compliance gaps, or generate compliance report text.
+If you need more source code context, use:
+SUGGEST_COMMAND: grep -rn "import library" {source_dir} --include="*.py"
+"""
 
-When the user asks to export or save results, confirm what will be saved.
-When the user asks to reclassify a component, explain your reasoning clearly."""
+
+def run_chat_agent(df_soup, project_description, context_conversation,
+                    provider, claude_client, gemini_client,
+                    claude_model, gemini_model, output_file, source_dir):
+
+    soup_summary = df_soup.to_string(index=False)
+    system_prompt = CHAT_SYSTEM_TEMPLATE.format(
+        project_description=project_description,
+        soup_summary=soup_summary,
+        source_dir=source_dir
+    )
+
+    # seed with context conversation so AI remembers what it found
+    conversation_history = context_conversation.copy()
 
     print("\n" + "="*60)
-    print("SOUP Analysis Agent — Chat Mode")
-    print(f"Provider: {provider.upper()}")
+    print(f"Step 3 — SOUP Analysis Chat — {provider.upper()}")
     print("="*60)
-    print("SOUP analysis complete. Ask me anything about the results.")
-    print("Examples:")
-    print("  'Show me only Class C components'")
-    print("  'Why is numpy classified as Class C?'")
-    print("  'What are the compliance gaps?'")
-    print("  'Export results'")
-    print("  'exit' to quit")
+    print("Ask questions about the SOUP analysis.")
+    print("'export' — save CSV  |  'exit' — quit")
     print("="*60 + "\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n[INFO] Session ended.")
             break
 
         if not user_input:
             continue
 
-        if user_input.lower() in ("exit", "quit", "done", "bye"):
-            print("\nAgent: Goodbye! Results saved to:", os.path.abspath(output_file))
+        if user_input.lower() in ("exit", "quit", "done"):
+            df_soup.to_csv(output_file, index=False, encoding="utf-8-sig")
+            print(f"\nAgent: Saved to {os.path.abspath(output_file)}")
             break
 
-        if user_input.lower() in ("export", "save", "export results"):
+        if user_input.lower() in ("export", "save"):
             df_soup.to_csv(output_file, index=False, encoding="utf-8-sig")
             print(f"\nAgent: Saved to {os.path.abspath(output_file)}\n")
             continue
@@ -380,45 +336,47 @@ When the user asks to reclassify a component, explain your reasoning clearly."""
         conversation_history.append({"role": "user", "content": user_input})
 
         if provider == "claude":
-            try:
-                response = claude_client.messages.create(
-                    model=claude_model,
-                    max_tokens=1024,
-                    system=system_prompt,
-                    messages=conversation_history
-                )
-                reply = response.content[0].text.strip()
-            except Exception as e:
-                reply = f"[Error: {e}]"
+            reply = call_claude(claude_client, claude_model,
+                                system_prompt, conversation_history, max_tokens=1024)
         else:
-            try:
-                # Build full conversation for Gemini
-                full = system_prompt + "\n\n"
-                for msg in conversation_history:
-                    role = "User" if msg["role"] == "user" else "Agent"
-                    full += f"{role}: {msg['content']}\n\n"
-                full += "Agent:"
-                response = gemini_client.models.generate_content(
-                    model=gemini_model, contents=full,
-                    config=genai_types.GenerateContentConfig(
-                        max_output_tokens=4096, temperature=0.1)
-                )
-                reply = response.text.strip()
-            except Exception as e:
-                reply = f"[Error: {e}]"
+            full = system_prompt + "\n\n"
+            for msg in conversation_history:
+                role = "User" if msg["role"] == "user" else "Agent"
+                full += f"{role}: {msg['content']}\n\n"
+            full += "Agent:"
+            reply = call_gemini(gemini_client, gemini_model, full, max_tokens=1024)
+
+        # handle subcommand suggestions in chat too
+        if "SUGGEST_COMMAND:" in reply:
+            lines = reply.split("\n")
+            cmd_line = next((l for l in lines if "SUGGEST_COMMAND:" in l), None)
+            if cmd_line:
+                suggested_cmd = cmd_line.replace("SUGGEST_COMMAND:", "").strip()
+                print(f"\nAgent: {reply}\n")
+                print(f"[COMMAND]: {suggested_cmd}")
+                approval = input("Run? (yes/no): ").strip().lower()
+                if approval in ("yes", "y"):
+                    print("[Running...]\n")
+                    cmd_output = run_subcommand(suggested_cmd, source_dir)
+                    print(f"[Output]:\n{cmd_output}\n")
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    conversation_history.append({
+                        "role": "user",
+                        "content": f"Command output:\n{cmd_output}\nPlease update analysis."
+                    })
+                    continue
+                else:
+                    print("[Skipped]\n")
+        else:
+            print(f"\nAgent: {reply}\n")
 
         conversation_history.append({"role": "assistant", "content": reply})
-        print(f"\nAgent: {reply}\n")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # Read API keys
+    # load api key from environment or prompt
     if args.provider == "claude":
         api_key = os.environ.get("ANTHROPIC_API_KEY") or input("Anthropic API key: ").strip()
         claude_client = anthropic.Anthropic(api_key=api_key)
@@ -432,126 +390,63 @@ def main():
         claude_model  = None
         gemini_model  = "gemini-2.5-flash"
 
-    # Read project description
     print(f"\n[INFO] Reading project description: {args.description}")
-    if not os.path.isfile(args.description):
-        print(f"[ERROR] File not found: {args.description}")
-        sys.exit(1)
-    with open(args.description, "r", encoding="utf-8") as f:
-        project_description = f.read()
+    project_description = read_file(args.description)
 
-    # Load SBOM or manifest
-    print(f"[INFO] Loading manifest/SBOM: {args.sbom}")
-    manifest_data, manifest_type = load_manifest(args.sbom)
+    print(f"[INFO] Reading manifest/SBOM: {args.sbom}")
+    manifest_content = read_file(args.sbom)
 
-    # Build component list
-    if manifest_type in ("sbom", "requirements"):
-        sbom_components = manifest_data
-    else:
-        # Raw manifest — AI will handle it in the chat
-        sbom_components = []
-        print("[INFO] Non-standard manifest — will pass raw content to AI.")
+    print(f"[INFO] Source directory: {args.source}")
+    print(f"[INFO] Provider: {args.provider.upper()}")
 
-    # Source code scan
-    import_map = {}
-    if args.source:
-        print(f"[INFO] Scanning source directory: {args.source}")
-        import_map = scan_direct_imports(args.source)
-
-    # Build SOUP register
-    rows = []
-    for comp in sbom_components:
-        name    = comp["name"]
-        version = comp["version"]
-        pinned  = version not in ("", "unpinned", None)
-
-        if is_tool(name):
-            continue  # skip dev tools
-
-        di, imf = get_reachability(name, import_map)
-        gap = "VERSION UNPINNED - IEC 62304 S8.1.2 not satisfied" if not pinned else ""
-        rows.append({
-            "name":             name,
-            "version":          version,
-            "supplier":         comp["supplier"],
-            "pinned":           pinned,
-            "directly_imported": di,
-            "import_files":     imf,
-            "compliance_gap":   gap,
-        })
-
-    df_soup = pd.DataFrame(rows)
-
-    if df_soup.empty:
-        print("[WARN] No SOUP components found. Check SBOM or manifest file.")
-        sys.exit(1)
-
-    print(f"\n[INFO] SOUP components: {len(df_soup)}")
-    print(f"[INFO] Directly imported: {df_soup['directly_imported'].sum()}")
-    print(f"[INFO] Unpinned: {(~df_soup['pinned']).sum()}")
-
-    # AI Classification
-    print(f"\n[INFO] Classifying with {args.provider.upper()}...\n")
-    project_context = (
-        f"{project_description}\n\n"
-        f"Components found: {', '.join(df_soup['name'].tolist())}"
+    # step 1 — initial classification
+    print(f"\n[Step 1] Parsing manifest and classifying SOUP components...\n")
+    components = initial_classification(
+        args.provider, claude_client, gemini_client,
+        claude_model, gemini_model,
+        project_description, manifest_content
     )
 
-    ai_classes, ai_uses, ai_rationales = [], [], []
+    if not components:
+        print("[ERROR] No components found. Check manifest file and API key.")
+        sys.exit(1)
 
-    for _, row in df_soup.iterrows():
-        if args.provider == "claude":
-            result = classify_claude(
-                claude_client, claude_model,
-                row["name"], row["version"], row["supplier"],
-                row["directly_imported"], row["import_files"],
-                project_context
-            )
-        else:
-            result = classify_gemini(
-                gemini_client, gemini_model,
-                row["name"], row["version"], row["supplier"],
-                row["directly_imported"], row["import_files"],
-                project_context
-            )
+    df_soup = pd.DataFrame(components)
+    print(f"[INFO] {len(df_soup)} SOUP components identified.")
 
-        ai_classes.append(result.get("class", "B"))
-        ai_uses.append(result.get("intended_use", ""))
-        ai_rationales.append(result.get("rationale", ""))
-        print(f"  {row['name']}: Class {result.get('class','?')} — {result.get('intended_use','')[:60]}")
-        time.sleep(0.3)
-
-    df_soup["ai_class"]        = ai_classes
-    df_soup["ai_intended_use"] = ai_uses
-    df_soup["ai_rationale"]    = ai_rationales
-
-    # Save initial output
-    df_soup.to_csv(args.output, index=False, encoding="utf-8-sig")
-    print(f"\n[INFO] Initial SOUP register saved: {os.path.abspath(args.output)}")
-
-    # Print Clause 7.1.3 table
     print("\n" + "="*60)
     print("IEC 62304 Clause 7.1.3 — Initial SOUP Listing")
     print("="*60)
     for _, row in df_soup.iterrows():
-        print(f"\n  {row['name']} v{row['version']}")
-        print(f"  Supplier:      {row['supplier']}")
-        print(f"  Safety Class:  Class {row['ai_class']}")
-        print(f"  Intended Use:  {row['ai_intended_use']}")
-        print(f"  Direct Import: {'Yes' if row['directly_imported'] else 'No'}")
-        if row["compliance_gap"]:
-            print(f"  [GAP] {row['compliance_gap']}")
+        print(f"\n  {row.get('name','')} v{row.get('version','')}")
+        print(f"  Supplier:     {row.get('supplier','')}")
+        print(f"  Class:        {row.get('class','')}")
+        print(f"  Intended Use: {row.get('intended_use','')}")
+        if row.get("compliance_gap"):
+            print(f"  [GAP] {row.get('compliance_gap','')}")
 
-    # Start chat agent
+    df_soup.to_csv(args.output, index=False, encoding="utf-8-sig")
+    print(f"\n[INFO] Register saved: {os.path.abspath(args.output)}")
+
+    # step 2 — source code context gathering before chat
+    context_conversation = context_gathering_loop(
+        args.provider, claude_client, gemini_client,
+        claude_model, gemini_model,
+        project_description, components, args.source
+    )
+
+    # step 3 — chat agent
     run_chat_agent(
         df_soup=df_soup,
         project_description=project_description,
+        context_conversation=context_conversation,
         provider=args.provider,
         claude_client=claude_client,
         gemini_client=gemini_client,
         claude_model=claude_model,
         gemini_model=gemini_model,
-        output_file=args.output
+        output_file=args.output,
+        source_dir=args.source
     )
 
 
